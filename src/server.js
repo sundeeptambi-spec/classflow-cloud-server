@@ -14,7 +14,7 @@ const envFile = path.join(rootDir, ".env");
 await loadEnvFile();
 
 const PORT = Number(process.env.PORT || 4180);
-const ADMIN_TOKEN = process.env.CLASSFLOW_ADMIN_TOKEN || "change-this-admin-token";
+const ADMIN_TOKEN = process.env.CLASSFLOW_ADMIN_TOKEN || "";
 const BRANDING_ADMIN_PIN = process.env.BRANDING_ADMIN_PIN || "1234";
 const DEFAULT_ACTIVATION_MONTHS = Number(process.env.CLASSFLOW_DEFAULT_ACTIVATION_MONTHS || 6);
 const DEFAULT_MONTHLY_QNA_LIMIT = Number(process.env.CLASSFLOW_DEFAULT_MONTHLY_QNA_LIMIT || 60);
@@ -24,11 +24,16 @@ const GROQ_MODEL = process.env.GROQ_MODEL || "openai/gpt-oss-20b";
 const GEMINI_API_KEY = process.env.GEMINI_API_KEY || "";
 const GEMINI_MODEL = process.env.GEMINI_MODEL || "gemini-2.5-flash";
 const QNA_PROMPT_VERSION = "classroom-v4";
+const SERVER_VERSION = "0.1.1";
 const DATABASE_URL = process.env.DATABASE_URL || "";
 const DATABASE_SSL = process.env.CLASSFLOW_DATABASE_SSL === "true";
 
 if (!DATABASE_URL) {
   throw new Error("DATABASE_URL is required. Add PostgreSQL on Railway and set DATABASE_URL before starting the server.");
+}
+
+if (!ADMIN_TOKEN || ADMIN_TOKEN === "change-this-admin-token") {
+  throw new Error("CLASSFLOW_ADMIN_TOKEN must be set to a private value before starting the server.");
 }
 
 const { Pool } = pg;
@@ -71,7 +76,7 @@ async function route(req, res) {
     sendJson(res, 200, {
       ok: true,
       service: "Class Flow Cloud Server",
-      version: "0.1.0",
+      version: SERVER_VERSION,
       admin: "/admin"
     });
     return;
@@ -82,6 +87,7 @@ async function route(req, res) {
       ok: true,
       status: "healthy",
       time: new Date().toISOString(),
+      version: SERVER_VERSION,
       aiProvider: aiProviderName(),
       storage: "postgresql"
     });
@@ -152,6 +158,7 @@ async function route(req, res) {
       ok: true,
       config: {
         port: PORT,
+        version: SERVER_VERSION,
         defaultActivationMonths: DEFAULT_ACTIVATION_MONTHS,
         defaultMonthlyQnaLimit: DEFAULT_MONTHLY_QNA_LIMIT,
         aiProvider: aiProviderName(),
@@ -287,6 +294,7 @@ async function checkActivation(schoolId, deviceId = "") {
 
   return {
     schoolId,
+    panelDeviceId: school.deviceId,
     active,
     reason: active ? "ACTIVE" : school.status === "blocked" ? "BLOCKED" : "EXPIRED",
     activationExpires: school.activationExpires,
@@ -404,12 +412,23 @@ async function requestQnaFromPdf(input) {
 }
 
 async function generateQna(chapter) {
+  const errors = [];
   if (GROQ_API_KEY) {
-    return await generateQnaWithGroq(chapter);
+    try {
+      return await generateQnaWithGroq(chapter);
+    } catch (error) {
+      errors.push(error);
+      if (!GEMINI_API_KEY && !FAKE_AI_ENABLED) throw error;
+    }
   }
 
   if (GEMINI_API_KEY) {
-    return await generateQnaWithGemini(chapter);
+    try {
+      return await generateQnaWithGemini(chapter);
+    } catch (error) {
+      errors.push(error);
+      if (!FAKE_AI_ENABLED) throw error;
+    }
   }
 
   if (!FAKE_AI_ENABLED) {
@@ -418,51 +437,67 @@ async function generateQna(chapter) {
 
   return {
     generatedBy: "local-test-generator",
-    notes: "Test generation only. Replace this with a real free AI provider later.",
-    items: [
-      {
-        type: "short",
-        question: `What is the main topic of ${chapter.chapter}?`,
-        answer: `${chapter.chapter} is the selected lesson or PDF topic for classroom discussion.`
-      },
-      {
-        type: "short",
-        question: `How can a teacher use ${chapter.chapter} in class?`,
-        answer: "The teacher can use it for explanation, revision, oral questions, and short written practice."
-      }
-    ]
+    notes: errors.length
+      ? "Fallback test generation after AI provider error. Do not use for production classroom quality."
+      : "Test generation only. Replace this with a real free AI provider later.",
+    items: fakeQnaItems(chapter)
   };
 }
 
-async function generateQnaWithGroq(chapter) {
-  let response;
-  try {
-    response = await fetchJson("https://api.groq.com/openai/v1/chat/completions", {
-      method: "POST",
-      headers: {
-        "Authorization": `Bearer ${GROQ_API_KEY}`,
-        "Content-Type": "application/json"
-      },
-      body: JSON.stringify(groqRequestBody(chapter, true))
-    });
-  } catch (error) {
-    const message = String(error.message || "");
-    if (!message.toLowerCase().includes("json")) throw error;
-    response = await fetchJson("https://api.groq.com/openai/v1/chat/completions", {
-      method: "POST",
-      headers: {
-        "Authorization": `Bearer ${GROQ_API_KEY}`,
-        "Content-Type": "application/json"
-      },
-      body: JSON.stringify(groqRequestBody(chapter, false))
-    });
-  }
-
-  const text = response?.choices?.[0]?.message?.content || "";
-  return generatedQnaFromText(text, `groq:${GROQ_MODEL}`);
+function fakeQnaItems(chapter) {
+  const count = targetQuestionCount(chapter);
+  const base = [
+    ["short", `What is the main topic of ${chapter.chapter}?`, `${chapter.chapter} is the selected lesson or PDF topic for classroom discussion.`],
+    ["short", `How can a teacher use ${chapter.chapter} in class?`, "The teacher can use it for explanation, revision, oral questions, and short written practice."],
+    ["fill", `${chapter.chapter} is useful for classroom ___.`, "revision"],
+    ["true-false", `${chapter.chapter} can be discussed through questions and answers. (True/False)`, "True"],
+    ["short", `Why should students discuss ${chapter.chapter}?`, "Discussion helps students recall ideas and explain them in their own words."],
+    ["higher-order", `How can students connect ${chapter.chapter} with daily life?`, "They can share examples from home, school, or their surroundings."],
+    ["short", `What should a teacher check after teaching ${chapter.chapter}?`, "The teacher should check whether students understood key ideas and can answer simple questions."],
+    ["true-false", `Only reading silently is enough to understand every chapter. (True/False)`, "False"],
+    ["short", `What is one classroom activity for ${chapter.chapter}?`, "Students can answer oral questions, write short answers, or explain examples."],
+    ["higher-order", `Why are follow-up questions helpful after ${chapter.chapter}?`, "They help students think deeper and correct misunderstandings."]
+  ];
+  return base.slice(0, count).map(([type, question, answer]) => ({
+    type,
+    question,
+    answer,
+    explanation: "This is a local test item.\nIt checks the Q&A flow without using online AI.\nUse server AI for final classroom quality."
+  }));
 }
 
-function groqRequestBody(chapter, strictJson) {
+async function generateQnaWithGroq(chapter) {
+  const desiredCount = targetQuestionCount(chapter);
+  const attempts = [
+    { strictJson: true, retry: false },
+    { strictJson: false, retry: false },
+    { strictJson: false, retry: true }
+  ];
+  let lastError = null;
+
+  for (const attempt of attempts) {
+    try {
+      const response = await fetchJson("https://api.groq.com/openai/v1/chat/completions", {
+        method: "POST",
+        headers: {
+          "Authorization": `Bearer ${GROQ_API_KEY}`,
+          "Content-Type": "application/json"
+        },
+        body: JSON.stringify(groqRequestBody(chapter, attempt.strictJson, attempt.retry))
+      });
+      const text = response?.choices?.[0]?.message?.content || "";
+      return generatedQnaFromText(text, `groq:${GROQ_MODEL}`, desiredCount);
+    } catch (error) {
+      lastError = error;
+      const message = String(error.message || "").toLowerCase();
+      if (!message.includes("json") && !message.includes("too few")) throw error;
+    }
+  }
+
+  throw lastError || new HttpError(502, "AI_BAD_RESPONSE", "AI did not return enough usable Q&A");
+}
+
+function groqRequestBody(chapter, strictJson, retry = false) {
   const body = {
     model: GROQ_MODEL,
     temperature: strictJson ? 0.2 : 0.35,
@@ -473,7 +508,7 @@ function groqRequestBody(chapter, strictJson) {
       },
       {
         role: "user",
-        content: qnaPrompt(chapter)
+        content: qnaPrompt(chapter, retry)
       }
     ]
   };
@@ -484,6 +519,7 @@ function groqRequestBody(chapter, strictJson) {
 }
 
 async function generateQnaWithGemini(chapter) {
+  const desiredCount = targetQuestionCount(chapter);
   const response = await fetchJson(
     `https://generativelanguage.googleapis.com/v1beta/models/${encodeURIComponent(GEMINI_MODEL)}:generateContent`,
     {
@@ -496,7 +532,7 @@ async function generateQnaWithGemini(chapter) {
         contents: [
           {
             role: "user",
-            parts: [{ text: qnaPrompt(chapter) }]
+            parts: [{ text: qnaPrompt(chapter, false) }]
           }
         ],
         generationConfig: {
@@ -511,11 +547,21 @@ async function generateQnaWithGemini(chapter) {
     ?.map((part) => part.text || "")
     .join("")
     .trim();
-  return generatedQnaFromText(text, `gemini:${GEMINI_MODEL}`);
+  return generatedQnaFromText(text, `gemini:${GEMINI_MODEL}`, desiredCount);
 }
 
-function qnaPrompt(chapter) {
-  const questionCount = Math.max(6, Math.min(15, Number(chapter.questionCount || 10)));
+function targetQuestionCount(chapter) {
+  return Math.max(6, Math.min(15, Number(chapter.questionCount || 10)));
+}
+
+function minimumQuestionCount(questionCount) {
+  if (questionCount <= 6) return 5;
+  if (questionCount <= 10) return 8;
+  return 12;
+}
+
+function qnaPrompt(chapter, retry = false) {
+  const questionCount = targetQuestionCount(chapter);
   const style = String(chapter.difficulty || "balanced").toLowerCase();
   const styleLine = style === "easy"
     ? "Use simple recall and understanding questions suitable for quick classroom participation."
@@ -524,11 +570,13 @@ function qnaPrompt(chapter) {
       : "Use a balanced mix of recall, understanding, application, and classroom discussion questions.";
   const lines = [
     "Generate classroom questions and answers for a teacher.",
+    retry ? "The previous response had too few questions. This time return the full requested count." : "",
     "Return only valid JSON with this exact shape:",
     "{\"items\":[{\"type\":\"short\",\"question\":\"...\",\"answer\":\"...\",\"explanation\":\"...\"}]}",
     "Do not wrap the JSON in markdown fences.",
     "Do not add any text before or after the JSON object.",
     `Create exactly ${questionCount} items total.`,
+    `The items array must contain ${questionCount} complete question objects. Do not return fewer items.`,
     "Use a suitable mix of short answer, MCQ, fill in the blank, true/false, and higher-order questions.",
     "For MCQ, include options array with 4 options and answer as the correct option text.",
     "MCQ option strings must not include labels like A., B., C., D., or numbering. Put only the option text.",
@@ -554,26 +602,32 @@ function qnaPrompt(chapter) {
   if (chapter.chapterText) {
     lines.push("", "Chapter text:", chapter.chapterText);
   }
-  return lines.join("\n");
+  return lines.filter((line) => line !== "").join("\n");
 }
 
-function generatedQnaFromText(text, generatedBy) {
+function generatedQnaFromText(text, generatedBy, desiredCount = 10) {
   const parsed = parseJsonFromText(text);
   const items = Array.isArray(parsed?.items) ? parsed.items : [];
   if (!items.length) {
     throw new HttpError(502, "AI_BAD_RESPONSE", "AI did not return usable Q&A");
   }
+  const usableItems = items.map((item) => ({
+    type: clean(item.type || "short"),
+    question: clean(item.question),
+    answer: clean(item.answer),
+    explanation: clean(item.explanation),
+    options: Array.isArray(item.options) ? item.options.map(clean).filter(Boolean).slice(0, 6) : undefined
+  })).filter((item) => item.question && item.answer);
+
+  const minimumCount = minimumQuestionCount(desiredCount);
+  if (usableItems.length < minimumCount) {
+    throw new HttpError(502, "AI_BAD_RESPONSE_TOO_FEW", `AI returned too few questions (${usableItems.length}/${desiredCount})`);
+  }
 
   return {
     generatedBy,
     notes: "Generated by server-side AI and cached for reuse.",
-    items: items.slice(0, 12).map((item) => ({
-      type: clean(item.type || "short"),
-      question: clean(item.question),
-      answer: clean(item.answer),
-      explanation: clean(item.explanation),
-      options: Array.isArray(item.options) ? item.options.map(clean).filter(Boolean).slice(0, 6) : undefined
-    })).filter((item) => item.question && item.answer),
+    items: usableItems.slice(0, desiredCount),
     contentGrounded: true
   };
 }
@@ -690,6 +744,9 @@ async function saveQna(input) {
   if (!qna.items.length) {
     throw new HttpError(400, "VALIDATION_ERROR", "items are required");
   }
+  if (qna.generatedBy !== "manual-admin" && !qnaHasEnoughItems(qna, chapter.questionCount)) {
+    throw new HttpError(502, "AI_BAD_RESPONSE_TOO_FEW", "Generated Q&A did not include enough usable questions");
+  }
 
   await upsertQna(qna);
   return qna;
@@ -726,7 +783,7 @@ async function deleteQna(cacheKey) {
 async function getQna(chapterInput) {
   const chapter = normalizeChapter(chapterInput);
   const exact = await getQnaByCacheKey(qnaKey(chapter));
-  if (exact) return exact;
+  if (exact && qnaHasEnoughItems(exact, chapter.questionCount)) return exact;
   if (chapter.board.toLowerCase() === "pdf") {
     return await findPdfQna(chapter);
   }
@@ -749,10 +806,16 @@ async function findPdfQna(chapter) {
     const savedChapter = looseKey(saved.chapter);
     if ((savedBook === wantedBook || savedChapter === wantedChapter)
         || (savedBook === wantedChapter || savedChapter === wantedBook)) {
-      return qna;
+      if (qnaHasEnoughItems(qna, chapter.questionCount)) return qna;
     }
   }
   return null;
+}
+
+function qnaHasEnoughItems(qna, desiredCount = 10) {
+  const items = Array.isArray(qna?.items) ? qna.items : [];
+  const usableItems = items.filter((item) => clean(item?.question) && clean(item?.answer));
+  return usableItems.length >= minimumQuestionCount(targetQuestionCount({ questionCount: desiredCount }));
 }
 
 function looseKey(value) {
@@ -782,25 +845,27 @@ async function getUsageForPanel(school, deviceId = "") {
 async function recordQnaGeneration(school, deviceId, chapter) {
   const month = new Date().toISOString().slice(0, 7);
   const key = panelUsageKey(school, deviceId);
-  const usage = await getUsageForPanel(school, deviceId);
-  usage.generatedCount += 1;
-  usage.generatedChapters.push({
+  const generatedChapter = {
     cacheKey: qnaKey(chapter),
     title: chapter.chapter,
     book: chapter.book,
     schoolId: school.schoolId,
     deviceId: deviceId || school.deviceId || "",
     generatedAt: new Date().toISOString()
-  });
-  await db.query(`
+  };
+  const { rows } = await db.query(`
     insert into panel_usage (panel_key, usage_month, generated_count, generated_chapters, updated_at)
     values ($1, $2, $3, $4::jsonb, now())
     on conflict (panel_key, usage_month)
-    do update set generated_count = excluded.generated_count,
-      generated_chapters = excluded.generated_chapters,
+    do update set generated_count = panel_usage.generated_count + 1,
+      generated_chapters = panel_usage.generated_chapters || excluded.generated_chapters,
       updated_at = now()
-  `, [key, month, usage.generatedCount, JSON.stringify(usage.generatedChapters)]);
-  return usage;
+    returning generated_count, generated_chapters
+  `, [key, month, 1, JSON.stringify([generatedChapter])]);
+  return {
+    generatedCount: Number(rows[0]?.generated_count || 0),
+    generatedChapters: Array.isArray(rows[0]?.generated_chapters) ? rows[0].generated_chapters : []
+  };
 }
 
 async function schoolsWithUsage() {
@@ -1241,19 +1306,19 @@ function renderAdminPage() {
 <body>
   <header>
     <h1>Class Flow School Activation Admin</h1>
-    <div>Local prototype for free registration, activation extension, and Q&A usage control.</div>
+    <div>Railway server for registration, activation extension, Q&A cache, and panel usage control.</div>
   </header>
   <main>
     <section>
       <h2>Admin Token</h2>
       <div class="row">
-        <input id="token" size="36" value="${ADMIN_TOKEN}">
+        <input id="token" size="36" placeholder="Enter admin token">
         <button onclick="loadSchools()">Load Schools</button>
         <button onclick="loadConfig()">Server Status</button>
         <button onclick="exportSchools()">Export CSV</button>
       </div>
       <div id="configStatus" class="muted"></div>
-      <p class="muted">For real deployment, this token must be changed on the server.</p>
+      <p class="muted">Admin token is stored only as a Railway service variable.</p>
     </section>
     <section>
       <h2>Schools</h2>
