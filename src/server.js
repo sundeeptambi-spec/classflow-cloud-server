@@ -23,8 +23,8 @@ const GROQ_API_KEY = process.env.GROQ_API_KEY || "";
 const GROQ_MODEL = process.env.GROQ_MODEL || "openai/gpt-oss-20b";
 const GEMINI_API_KEY = process.env.GEMINI_API_KEY || "";
 const GEMINI_MODEL = process.env.GEMINI_MODEL || "gemini-2.5-flash";
-const QNA_PROMPT_VERSION = "classroom-v4";
-const SERVER_VERSION = "0.1.1";
+const QNA_PROMPT_VERSION = "classroom-v5";
+const SERVER_VERSION = "0.1.2";
 const DATABASE_URL = process.env.DATABASE_URL || "";
 const DATABASE_SSL = process.env.CLASSFLOW_DATABASE_SSL === "true";
 
@@ -313,6 +313,9 @@ async function requestQna(input) {
 
   const chapter = normalizeChapter(input.chapter || input);
   chapter.chapterText = clean(input.chapterText || input.text || input.chapter?.chapterText).slice(0, 24000);
+  if (chapter.chapterText && !chapter.pdfTextHash) {
+    chapter.pdfTextHash = createHash("sha256").update(chapter.chapterText).digest("hex").slice(0, 16);
+  }
   const cached = await getQna(chapter);
   if (cached) {
     return {
@@ -326,6 +329,21 @@ async function requestQna(input) {
   const usage = await getUsageForPanel(school, input.deviceId);
   if (usage.generatedCount >= school.qnaMonthlyLimit) {
     throw new HttpError(429, "QNA_LIMIT_REACHED", "Monthly Q&A generation limit reached for this panel");
+  }
+
+  if (!chapter.chapterText) {
+    return {
+      available: false,
+      error: "PDF_UPLOAD_REQUIRED",
+      message: "Upload the open PDF so Q&A can be generated from the displayed chapter.",
+      schoolId: school.schoolId,
+      monthlyLimit: school.qnaMonthlyLimit,
+      monthlyUsed: usage.generatedCount,
+      aiConfigured: Boolean(GROQ_API_KEY) || Boolean(GEMINI_API_KEY) || FAKE_AI_ENABLED,
+      aiProvider: aiProviderName(),
+      cacheKey: qnaKey(chapter),
+      chapter
+    };
   }
 
   const generated = await generateQna(chapter);
@@ -371,15 +389,6 @@ async function requestQnaFromPdf(input) {
   }
 
   const chapter = normalizeChapter(input.chapter || input);
-  const cached = await getQna(chapter);
-  if (cached) {
-    return {
-      available: true,
-      source: "cache",
-      counted: false,
-      qna: cached
-    };
-  }
 
   const usage = await getUsageForPanel(school, input.deviceId);
   if (usage.generatedCount >= school.qnaMonthlyLimit) {
@@ -402,6 +411,7 @@ async function requestQnaFromPdf(input) {
   if (text.length < 100) {
     throw new HttpError(422, "PDF_TEXT_NOT_FOUND", "Could not extract enough text from this PDF");
   }
+  chapter.pdfTextHash = createHash("sha256").update(text).digest("hex").slice(0, 16);
 
   return await requestQna({
     schoolId: input.schoolId,
@@ -898,6 +908,8 @@ function normalizeChapter(input = {}) {
     chapter: clean(input.chapter || input.chapterName),
     language: clean(input.language || "English"),
     contentVersion: clean(input.contentVersion || "v2026"),
+    pdfFileName: clean(input.pdfFileName || input.fileName),
+    pdfTextHash: clean(input.pdfTextHash),
     questionType: clean(input.questionType || "mixed"),
     difficulty: clean(input.difficulty || "balanced"),
     questionCount: Math.max(6, Math.min(15, Number(input.questionCount || 10)))
@@ -938,6 +950,8 @@ function qnaKey(chapter) {
     chapter.questionType,
     chapter.difficulty,
     chapter.questionCount,
+    chapter.pdfFileName,
+    chapter.pdfTextHash,
     QNA_PROMPT_VERSION
   ].map((value) => String(value || "").toLowerCase().trim()).join("|");
   return createHash("sha256").update(raw).digest("hex").slice(0, 32);
