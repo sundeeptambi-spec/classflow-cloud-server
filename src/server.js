@@ -435,31 +435,52 @@ async function generateQna(chapter) {
 }
 
 async function generateQnaWithGroq(chapter) {
-  const response = await fetchJson("https://api.groq.com/openai/v1/chat/completions", {
-    method: "POST",
-    headers: {
-      "Authorization": `Bearer ${GROQ_API_KEY}`,
-      "Content-Type": "application/json"
-    },
-    body: JSON.stringify({
-      model: GROQ_MODEL,
-      temperature: 0.35,
-      response_format: { type: "json_object" },
-      messages: [
-        {
-          role: "system",
-          content: "You create school classroom revision questions. Always return valid JSON only."
-        },
-        {
-          role: "user",
-          content: qnaPrompt(chapter)
-        }
-      ]
-    })
-  });
+  let response;
+  try {
+    response = await fetchJson("https://api.groq.com/openai/v1/chat/completions", {
+      method: "POST",
+      headers: {
+        "Authorization": `Bearer ${GROQ_API_KEY}`,
+        "Content-Type": "application/json"
+      },
+      body: JSON.stringify(groqRequestBody(chapter, true))
+    });
+  } catch (error) {
+    const message = String(error.message || "");
+    if (!message.toLowerCase().includes("json")) throw error;
+    response = await fetchJson("https://api.groq.com/openai/v1/chat/completions", {
+      method: "POST",
+      headers: {
+        "Authorization": `Bearer ${GROQ_API_KEY}`,
+        "Content-Type": "application/json"
+      },
+      body: JSON.stringify(groqRequestBody(chapter, false))
+    });
+  }
 
   const text = response?.choices?.[0]?.message?.content || "";
   return generatedQnaFromText(text, `groq:${GROQ_MODEL}`);
+}
+
+function groqRequestBody(chapter, strictJson) {
+  const body = {
+    model: GROQ_MODEL,
+    temperature: strictJson ? 0.2 : 0.35,
+    messages: [
+      {
+        role: "system",
+        content: "You create school classroom revision questions. Return one JSON object only. Do not use markdown."
+      },
+      {
+        role: "user",
+        content: qnaPrompt(chapter)
+      }
+    ]
+  };
+  if (strictJson) {
+    body.response_format = { type: "json_object" };
+  }
+  return body;
 }
 
 async function generateQnaWithGemini(chapter) {
@@ -505,6 +526,8 @@ function qnaPrompt(chapter) {
     "Generate classroom questions and answers for a teacher.",
     "Return only valid JSON with this exact shape:",
     "{\"items\":[{\"type\":\"short\",\"question\":\"...\",\"answer\":\"...\",\"explanation\":\"...\"}]}",
+    "Do not wrap the JSON in markdown fences.",
+    "Do not add any text before or after the JSON object.",
     `Create exactly ${questionCount} items total.`,
     "Use a suitable mix of short answer, MCQ, fill in the blank, true/false, and higher-order questions.",
     "For MCQ, include options array with 4 options and answer as the correct option text.",
@@ -565,17 +588,50 @@ async function fetchJson(url, options) {
 }
 
 function parseJsonFromText(text = "") {
+  const cleaned = String(text || "")
+    .trim()
+    .replace(/^```(?:json)?/i, "")
+    .replace(/```$/i, "")
+    .trim();
   try {
-    return JSON.parse(text);
+    return JSON.parse(cleaned);
   } catch {
-    const match = text.match(/\{[\s\S]*\}/);
-    if (!match) return null;
+    const jsonText = extractJsonObject(cleaned);
+    if (!jsonText) return null;
     try {
-      return JSON.parse(match[0]);
+      return JSON.parse(jsonText);
     } catch {
       return null;
     }
   }
+}
+
+function extractJsonObject(text) {
+  const start = text.indexOf("{");
+  if (start === -1) return "";
+  let depth = 0;
+  let inString = false;
+  let escaped = false;
+  for (let index = start; index < text.length; index += 1) {
+    const char = text[index];
+    if (escaped) {
+      escaped = false;
+      continue;
+    }
+    if (char === "\\") {
+      escaped = true;
+      continue;
+    }
+    if (char === "\"") {
+      inString = !inString;
+      continue;
+    }
+    if (inString) continue;
+    if (char === "{") depth += 1;
+    if (char === "}") depth -= 1;
+    if (depth === 0) return text.slice(start, index + 1);
+  }
+  return "";
 }
 
 function aiProviderName() {
