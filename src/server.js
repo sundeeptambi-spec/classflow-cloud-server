@@ -24,7 +24,7 @@ const GROQ_MODEL = process.env.GROQ_MODEL || "openai/gpt-oss-20b";
 const GEMINI_API_KEY = process.env.GEMINI_API_KEY || "";
 const GEMINI_MODEL = process.env.GEMINI_MODEL || "gemini-2.5-flash";
 const QNA_PROMPT_VERSION = "classroom-v6";
-const SERVER_VERSION = "0.1.3";
+const SERVER_VERSION = "0.1.4";
 const DATABASE_URL = process.env.DATABASE_URL || "";
 const DATABASE_SSL = process.env.CLASSFLOW_DATABASE_SSL === "true";
 
@@ -649,9 +649,27 @@ async function fetchJson(url, options) {
   const response = await fetch(url, options);
   const text = await response.text();
   if (!response.ok) {
-    throw new HttpError(502, "AI_PROVIDER_ERROR", text.slice(0, 300));
+    const providerMessage = parseProviderErrorMessage(text);
+    const lowerMessage = providerMessage.toLowerCase();
+    if (response.status === 429 || lowerMessage.includes("rate limit") || lowerMessage.includes("too many requests")) {
+      throw new HttpError(429, "AI_RATE_LIMIT", "AI free limit reached. Please try again after some time.");
+    }
+    throw new HttpError(502, "AI_PROVIDER_ERROR", providerMessage || "AI service could not generate Q&A right now. Please try again.");
   }
   return JSON.parse(text);
+}
+
+function parseProviderErrorMessage(text = "") {
+  const trimmed = String(text || "").trim();
+  if (!trimmed) return "";
+  try {
+    const json = JSON.parse(trimmed);
+    const message = json?.error?.message || json?.message || "";
+    if (message) return String(message).slice(0, 220);
+  } catch {
+    // Provider did not return JSON; use sanitized text below.
+  }
+  return trimmed.replace(/\s+/g, " ").slice(0, 220);
 }
 
 function parseJsonFromText(text = "") {
