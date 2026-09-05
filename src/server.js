@@ -23,8 +23,8 @@ const GROQ_API_KEY = process.env.GROQ_API_KEY || "";
 const GROQ_MODEL = process.env.GROQ_MODEL || "openai/gpt-oss-20b";
 const GEMINI_API_KEY = process.env.GEMINI_API_KEY || "";
 const GEMINI_MODEL = process.env.GEMINI_MODEL || "gemini-2.5-flash";
-const QNA_PROMPT_VERSION = "classroom-v7-language-lock";
-const SERVER_VERSION = "0.1.5";
+const QNA_PROMPT_VERSION = "classroom-v8-relevance-lock";
+const SERVER_VERSION = "0.1.6";
 const DATABASE_URL = process.env.DATABASE_URL || "";
 const DATABASE_SSL = process.env.CLASSFLOW_DATABASE_SSL === "true";
 
@@ -705,7 +705,9 @@ function qnaPrompt(chapter, retry = false) {
     "Do not translate the chapter into English unless the supplied chapter text itself is English or the requested Language is explicitly English.",
     "Do not create mixed-language output unless the chapter itself is mixed-language.",
     "If the mandatory output language is Hindi, do not write English questions or English explanations.",
-    "Use only the supplied chapter text for textbook-specific facts. If chapter text is not provided, create only general revision questions based on the title and do not invent textbook-specific facts.",
+    "Use only the supplied chapter text from the currently opened PDF for textbook-specific facts.",
+    "Do not answer from another chapter, another story, another lesson, or general memory.",
+    "If chapter text is not provided, create only general revision questions based on the title and do not invent textbook-specific facts.",
     "",
     "Chapter details:",
     `Board: ${chapter.board}`,
@@ -713,6 +715,7 @@ function qnaPrompt(chapter, retry = false) {
     `Subject: ${chapter.subject}`,
     `Book/PDF: ${chapter.book}`,
     `Chapter/PDF: ${chapter.chapter}`,
+    `Source PDF filename: ${chapter.pdfFileName}`,
     `Language requested: ${chapter.language}`,
     `Language detected: ${chapter.outputLanguage}`,
     `Question style: ${chapter.difficulty}`,
@@ -922,32 +925,6 @@ async function getQna(chapterInput) {
   const chapter = normalizeChapter(chapterInput);
   const exact = await getQnaByCacheKey(qnaKey(chapter));
   if (exact && qnaHasEnoughItems(exact, chapter.questionCount)) return exact;
-  if (chapter.board.toLowerCase() === "pdf") {
-    if (chapter.pdfTextHash) return null;
-    return await findPdfQna(chapter);
-  }
-  return null;
-}
-
-async function findPdfQna(chapter) {
-  const wantedBook = looseKey(chapter.book);
-  const wantedChapter = looseKey(chapter.chapter);
-  const { rows } = await db.query(`
-    select cache_key, chapter, question_type, difficulty, items, notes, generated_by, created_at, updated_at
-    from qna_cache
-    where lower(chapter->>'board') = 'pdf'
-    order by updated_at desc
-  `);
-  for (const row of rows) {
-    const qna = qnaFromRow(row);
-    const saved = qna.chapter;
-    const savedBook = looseKey(saved.book);
-    const savedChapter = looseKey(saved.chapter);
-    if ((savedBook === wantedBook || savedChapter === wantedChapter)
-        || (savedBook === wantedChapter || savedChapter === wantedBook)) {
-      if (qnaHasEnoughItems(qna, chapter.questionCount)) return qna;
-    }
-  }
   return null;
 }
 
@@ -955,13 +932,6 @@ function qnaHasEnoughItems(qna, desiredCount = 10) {
   const items = Array.isArray(qna?.items) ? qna.items : [];
   const usableItems = items.filter((item) => clean(item?.question) && clean(item?.answer));
   return usableItems.length >= minimumQuestionCount(targetQuestionCount({ questionCount: desiredCount }));
-}
-
-function looseKey(value) {
-  return String(value || "")
-    .toLowerCase()
-    .replace(/\.pdf$/i, "")
-    .replace(/[^a-z0-9]+/g, "");
 }
 
 function panelUsageKey(school, deviceId = "") {
