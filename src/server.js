@@ -23,8 +23,8 @@ const GROQ_API_KEY = process.env.GROQ_API_KEY || "";
 const GROQ_MODEL = process.env.GROQ_MODEL || "openai/gpt-oss-20b";
 const GEMINI_API_KEY = process.env.GEMINI_API_KEY || "";
 const GEMINI_MODEL = process.env.GEMINI_MODEL || "gemini-2.5-flash";
-const QNA_PROMPT_VERSION = "classroom-v5";
-const SERVER_VERSION = "0.1.2";
+const QNA_PROMPT_VERSION = "classroom-v6";
+const SERVER_VERSION = "0.1.3";
 const DATABASE_URL = process.env.DATABASE_URL || "";
 const DATABASE_SSL = process.env.CLASSFLOW_DATABASE_SSL === "true";
 
@@ -596,7 +596,10 @@ function qnaPrompt(chapter, retry = false) {
     "The explanation should help the teacher explain why the answer is correct, and include a small classroom hint or example when useful.",
     "Avoid one-word or one-sentence explanations except for very simple true/false facts.",
     styleLine,
-    "Do not translate from another language. Use the supplied chapter text and its language style when chapter text is provided.",
+    "Output language rule: If Language is 'Same as chapter', first detect the language and script of the supplied chapter text, then write every question, answer, option, and explanation in that same language and natural classroom style.",
+    "For Hindi chapter text, write natural Hindi in Devanagari. For Odia, Bengali, Tamil, Telugu, Marathi, Gujarati, Kannada, Malayalam, Urdu, Punjabi, Sanskrit, or any other language, use that chapter's script and textbook style.",
+    "Do not translate the chapter into English unless the supplied chapter text itself is English or the requested Language is explicitly English.",
+    "Do not create mixed-language output unless the chapter itself is mixed-language.",
     "Use only the supplied chapter text for textbook-specific facts. If chapter text is not provided, create only general revision questions based on the title and do not invent textbook-specific facts.",
     "",
     "Chapter details:",
@@ -795,6 +798,7 @@ async function getQna(chapterInput) {
   const exact = await getQnaByCacheKey(qnaKey(chapter));
   if (exact && qnaHasEnoughItems(exact, chapter.questionCount)) return exact;
   if (chapter.board.toLowerCase() === "pdf") {
+    if (chapter.pdfTextHash) return null;
     return await findPdfQna(chapter);
   }
   return null;
@@ -906,7 +910,7 @@ function normalizeChapter(input = {}) {
     subject: clean(input.subject),
     book: clean(input.book),
     chapter: clean(input.chapter || input.chapterName),
-    language: clean(input.language || "English"),
+    language: clean(input.language || "Same as chapter"),
     contentVersion: clean(input.contentVersion || "v2026"),
     pdfFileName: clean(input.pdfFileName || input.fileName),
     pdfTextHash: clean(input.pdfTextHash),
@@ -1362,7 +1366,7 @@ function renderAdminPage() {
         <input id="qSubject" value="PDF" placeholder="Subject">
         <input id="qBook" placeholder="Book/PDF name">
         <input id="qChapter" placeholder="Chapter/PDF name">
-        <input id="qLanguage" value="English" placeholder="Language">
+        <input id="qLanguage" value="Same as chapter" placeholder="Language">
         <input id="qType" value="mixed" placeholder="Question type">
         <input id="qDifficulty" value="standard" placeholder="Difficulty">
         <textarea id="qItems" class="wide" placeholder="One question per line. Use: Question | Answer"></textarea>
