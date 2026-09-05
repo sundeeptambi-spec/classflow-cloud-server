@@ -23,8 +23,8 @@ const GROQ_API_KEY = process.env.GROQ_API_KEY || "";
 const GROQ_MODEL = process.env.GROQ_MODEL || "openai/gpt-oss-20b";
 const GEMINI_API_KEY = process.env.GEMINI_API_KEY || "";
 const GEMINI_MODEL = process.env.GEMINI_MODEL || "gemini-2.5-flash";
-const QNA_PROMPT_VERSION = "classroom-v6";
-const SERVER_VERSION = "0.1.4";
+const QNA_PROMPT_VERSION = "classroom-v7-language-lock";
+const SERVER_VERSION = "0.1.5";
 const DATABASE_URL = process.env.DATABASE_URL || "";
 const DATABASE_SSL = process.env.CLASSFLOW_DATABASE_SSL === "true";
 
@@ -316,6 +316,7 @@ async function requestQna(input) {
   if (chapter.chapterText && !chapter.pdfTextHash) {
     chapter.pdfTextHash = createHash("sha256").update(chapter.chapterText).digest("hex").slice(0, 16);
   }
+  applyDetectedLanguage(chapter);
   const cached = await getQna(chapter);
   if (cached) {
     return {
@@ -496,11 +497,11 @@ async function generateQnaWithGroq(chapter) {
         body: JSON.stringify(groqRequestBody(chapter, attempt.strictJson, attempt.retry))
       });
       const text = response?.choices?.[0]?.message?.content || "";
-      return generatedQnaFromText(text, `groq:${GROQ_MODEL}`, desiredCount);
+      return generatedQnaFromText(text, `groq:${GROQ_MODEL}`, desiredCount, chapter);
     } catch (error) {
       lastError = error;
       const message = String(error.message || "").toLowerCase();
-      if (!message.includes("json") && !message.includes("too few")) throw error;
+      if (!message.includes("json") && !message.includes("too few") && !message.includes("language")) throw error;
     }
   }
 
@@ -557,7 +558,7 @@ async function generateQnaWithGemini(chapter) {
     ?.map((part) => part.text || "")
     .join("")
     .trim();
-  return generatedQnaFromText(text, `gemini:${GEMINI_MODEL}`, desiredCount);
+  return generatedQnaFromText(text, `gemini:${GEMINI_MODEL}`, desiredCount, chapter);
 }
 
 function targetQuestionCount(chapter) {
@@ -570,8 +571,109 @@ function minimumQuestionCount(questionCount) {
   return 12;
 }
 
+function applyDetectedLanguage(chapter) {
+  if (!chapter) return;
+  const requested = clean(chapter.language || "");
+  if (requested && !/^same\s+as\s+chapter$/i.test(requested) && !/^auto$/i.test(requested)) {
+    chapter.outputLanguage = requested;
+    chapter.outputScript = scriptFromLanguage(requested);
+    return;
+  }
+
+  const detected = detectChapterLanguage(chapter);
+  chapter.outputLanguage = detected.language;
+  chapter.outputScript = detected.script;
+}
+
+function detectChapterLanguage(chapter = {}) {
+  const text = [
+    chapter.subject,
+    chapter.book,
+    chapter.chapter,
+    chapter.chapterText
+  ].map((value) => String(value || "")).join("\n");
+
+  const counts = [
+    { language: languageForDevanagariContext(text), script: "Devanagari", count: countScriptChars(text, "Devanagari") },
+    { language: "Odia", script: "Odia", count: countScriptChars(text, "Odia") },
+    { language: "Bengali", script: "Bengali", count: countScriptChars(text, "Bengali") },
+    { language: "Tamil", script: "Tamil", count: countScriptChars(text, "Tamil") },
+    { language: "Telugu", script: "Telugu", count: countScriptChars(text, "Telugu") },
+    { language: "Gujarati", script: "Gujarati", count: countScriptChars(text, "Gujarati") },
+    { language: "Kannada", script: "Kannada", count: countScriptChars(text, "Kannada") },
+    { language: "Malayalam", script: "Malayalam", count: countScriptChars(text, "Malayalam") },
+    { language: "Punjabi", script: "Gurmukhi", count: countScriptChars(text, "Gurmukhi") },
+    { language: "Urdu", script: "Arabic", count: countScriptChars(text, "Arabic") }
+  ].sort((a, b) => b.count - a.count);
+
+  if (counts[0].count >= 20) {
+    return { language: counts[0].language, script: counts[0].script };
+  }
+  return { language: "English", script: "Latin" };
+}
+
+function languageForDevanagariContext(text) {
+  const lower = String(text || "").toLowerCase();
+  if (lower.includes("marathi") || lower.includes("मराठी")) return "Marathi";
+  if (lower.includes("sanskrit") || lower.includes("संस्कृत")) return "Sanskrit";
+  return "Hindi";
+}
+
+function scriptFromLanguage(language) {
+  const lower = String(language || "").toLowerCase();
+  if (lower.includes("hindi") || lower.includes("marathi") || lower.includes("sanskrit")) return "Devanagari";
+  if (lower.includes("odia") || lower.includes("oriya")) return "Odia";
+  if (lower.includes("bengali")) return "Bengali";
+  if (lower.includes("tamil")) return "Tamil";
+  if (lower.includes("telugu")) return "Telugu";
+  if (lower.includes("gujarati")) return "Gujarati";
+  if (lower.includes("kannada")) return "Kannada";
+  if (lower.includes("malayalam")) return "Malayalam";
+  if (lower.includes("punjabi")) return "Gurmukhi";
+  if (lower.includes("urdu")) return "Arabic";
+  return "Latin";
+}
+
+function countScriptChars(text, script) {
+  const ranges = {
+    Devanagari: /[\u0900-\u097F]/g,
+    Bengali: /[\u0980-\u09FF]/g,
+    Gurmukhi: /[\u0A00-\u0A7F]/g,
+    Gujarati: /[\u0A80-\u0AFF]/g,
+    Odia: /[\u0B00-\u0B7F]/g,
+    Tamil: /[\u0B80-\u0BFF]/g,
+    Telugu: /[\u0C00-\u0C7F]/g,
+    Kannada: /[\u0C80-\u0CFF]/g,
+    Malayalam: /[\u0D00-\u0D7F]/g,
+    Arabic: /[\u0600-\u06FF]/g,
+    Latin: /[A-Za-z]/g
+  };
+  return (String(text || "").match(ranges[script] || ranges.Latin) || []).length;
+}
+
+function assertQnaLanguage(items, chapter = {}) {
+  applyDetectedLanguage(chapter);
+  const script = chapter.outputScript || "Latin";
+  if (script === "Latin") return;
+
+  const combined = items.map((item) => [
+    item.question,
+    item.answer,
+    item.explanation,
+    ...(Array.isArray(item.options) ? item.options : [])
+  ].join(" ")).join(" ");
+
+  const expectedCount = countScriptChars(combined, script);
+  const latinCount = countScriptChars(combined, "Latin");
+  const minimumExpected = Math.max(20, Math.floor((expectedCount + latinCount) * 0.25));
+  if (expectedCount < minimumExpected && latinCount > expectedCount) {
+    throw new HttpError(502, "AI_LANGUAGE_MISMATCH", `AI returned the wrong language. Expected ${chapter.outputLanguage}.`);
+  }
+}
+
 function qnaPrompt(chapter, retry = false) {
   const questionCount = targetQuestionCount(chapter);
+  applyDetectedLanguage(chapter);
   const style = String(chapter.difficulty || "balanced").toLowerCase();
   const styleLine = style === "easy"
     ? "Use simple recall and understanding questions suitable for quick classroom participation."
@@ -580,7 +682,7 @@ function qnaPrompt(chapter, retry = false) {
       : "Use a balanced mix of recall, understanding, application, and classroom discussion questions.";
   const lines = [
     "Generate classroom questions and answers for a teacher.",
-    retry ? "The previous response had too few questions. This time return the full requested count." : "",
+    retry ? "The previous response was not acceptable. This time strictly follow the requested count and output language." : "",
     "Return only valid JSON with this exact shape:",
     "{\"items\":[{\"type\":\"short\",\"question\":\"...\",\"answer\":\"...\",\"explanation\":\"...\"}]}",
     "Do not wrap the JSON in markdown fences.",
@@ -596,10 +698,13 @@ function qnaPrompt(chapter, retry = false) {
     "The explanation should help the teacher explain why the answer is correct, and include a small classroom hint or example when useful.",
     "Avoid one-word or one-sentence explanations except for very simple true/false facts.",
     styleLine,
-    "Output language rule: If Language is 'Same as chapter', first detect the language and script of the supplied chapter text, then write every question, answer, option, and explanation in that same language and natural classroom style.",
+    `Mandatory output language: ${chapter.outputLanguage}.`,
+    `Mandatory output script: ${chapter.outputScript}.`,
+    "Every question, answer, MCQ option, and explanation must use the mandatory output language and script.",
     "For Hindi chapter text, write natural Hindi in Devanagari. For Odia, Bengali, Tamil, Telugu, Marathi, Gujarati, Kannada, Malayalam, Urdu, Punjabi, Sanskrit, or any other language, use that chapter's script and textbook style.",
     "Do not translate the chapter into English unless the supplied chapter text itself is English or the requested Language is explicitly English.",
     "Do not create mixed-language output unless the chapter itself is mixed-language.",
+    "If the mandatory output language is Hindi, do not write English questions or English explanations.",
     "Use only the supplied chapter text for textbook-specific facts. If chapter text is not provided, create only general revision questions based on the title and do not invent textbook-specific facts.",
     "",
     "Chapter details:",
@@ -608,7 +713,8 @@ function qnaPrompt(chapter, retry = false) {
     `Subject: ${chapter.subject}`,
     `Book/PDF: ${chapter.book}`,
     `Chapter/PDF: ${chapter.chapter}`,
-    `Language: ${chapter.language}`,
+    `Language requested: ${chapter.language}`,
+    `Language detected: ${chapter.outputLanguage}`,
     `Question style: ${chapter.difficulty}`,
     `Question count: ${questionCount}`
   ];
@@ -618,7 +724,7 @@ function qnaPrompt(chapter, retry = false) {
   return lines.filter((line) => line !== "").join("\n");
 }
 
-function generatedQnaFromText(text, generatedBy, desiredCount = 10) {
+function generatedQnaFromText(text, generatedBy, desiredCount = 10, chapter = {}) {
   const parsed = parseJsonFromText(text);
   const items = Array.isArray(parsed?.items) ? parsed.items : [];
   if (!items.length) {
@@ -636,6 +742,7 @@ function generatedQnaFromText(text, generatedBy, desiredCount = 10) {
   if (usableItems.length < minimumCount) {
     throw new HttpError(502, "AI_BAD_RESPONSE_TOO_FEW", `AI returned too few questions (${usableItems.length}/${desiredCount})`);
   }
+  assertQnaLanguage(usableItems, chapter);
 
   return {
     generatedBy,
@@ -961,6 +1068,7 @@ function chapterFromSearch(params) {
 }
 
 function qnaKey(chapter) {
+  applyDetectedLanguage(chapter);
   const raw = [
     chapter.board,
     chapter.className,
@@ -968,6 +1076,8 @@ function qnaKey(chapter) {
     chapter.book,
     chapter.chapter,
     chapter.language,
+    chapter.outputLanguage,
+    chapter.outputScript,
     chapter.contentVersion,
     chapter.questionType,
     chapter.difficulty,
